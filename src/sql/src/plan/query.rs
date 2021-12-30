@@ -1589,21 +1589,45 @@ fn plan_view_select(
         relation_expr = relation_expr.filter(vec![expr]);
     }
 
-    // Step 3. Gather aggregates.
-    let aggregates = {
-        let mut aggregate_visitor = AggregateFuncVisitor::new(&qcx.scx);
+    // Step 3. Gather aggregates and table functions.
+    let (aggregates, table_funcs) = {
+        let mut aggregate_visitor = AggregateTableFuncVisitor::new(&qcx.scx);
         aggregate_visitor.visit_select(&s);
         for o in order_by_exprs {
             aggregate_visitor.visit_order_by_expr(o);
         }
         aggregate_visitor.into_result()?
     };
+    // TODO: Stuff the unmorphed Functions as Exprs into a scope so that when
+    // SELECT resolution below looks for them it can find them. Then also make the
+    // scope smart enough so its Expr referrs to the correct columns in the rows
+    // from return'd expr. And make sure wildcard works somehow?
+    if !table_funcs.is_empty() {
+        let table_funcs = table_funcs
+            .into_iter()
+            .map(|f| match f {
+                Function {
+                    name,
+                    args,
+                    filter: None,
+                    over: None,
+                    distinct: false,
+                } => Ok(TableFunction {
+                    name: name.clone(),
+                    args: args.clone(),
+                }),
+                _ => bail_unsupported!(f),
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let (expr, scope, num_cols) = plan_rows_from(qcx, &table_funcs, None, false)?;
+
+    }
 
     // Step 4. Expand SELECT clause.
     let projection = {
         let ecx = &ExprContext {
             qcx,
-            name: "SELECT clause",
+            name: "SELECT1 clause",
             scope: &from_scope,
             relation_type: &qcx.relation_type(&relation_expr),
             allow_aggregates: true,
@@ -1728,7 +1752,7 @@ fn plan_view_select(
         for (select_item, column_name) in &projection {
             let ecx = &ExprContext {
                 qcx,
-                name: "SELECT clause",
+                name: "SELECT2 clause",
                 scope: &group_scope,
                 relation_type: &new_type,
                 allow_aggregates: true,
@@ -2074,7 +2098,11 @@ fn plan_table_factor(
             functions,
             alias,
             with_ordinality,
-        } => plan_rows_from(qcx, functions, alias.as_ref(), *with_ordinality),
+        } => {
+            let (expr, scope, _num_cols) =
+                plan_rows_from(qcx, functions, alias.as_ref(), *with_ordinality)?;
+            Ok((expr, scope))
+        }
 
         TableFactor::Derived {
             lateral,
@@ -2150,21 +2178,31 @@ fn plan_rows_from(
     functions: &[TableFunction<Aug>],
     alias: Option<&TableAlias>,
     with_ordinality: bool,
-) -> Result<(HirRelationExpr, Scope), PlanError> {
+) -> Result<(HirRelationExpr, Scope, Vec<usize>), PlanError> {
     // If there's only a single table function, planning proceeds as if `ROWS
     // FROM` hadn't been written at all.
     if let [function] = functions {
-        return plan_solitary_table_function(qcx, function, alias, with_ordinality);
+        let (expr, scope) = plan_solitary_table_function(qcx, function, alias, with_ordinality)?;
+        let mut len = scope.items.len();
+        if with_ordinality {
+            len -= 1;
+        }
+        return Ok((expr, scope, vec![len]));
     }
+
+    let mut num_cols = Vec::new();
 
     // Join together each of the table functions in turn. The last column is
     // always the column to join against and is maintained to be the coalesence
     // of the row number column for all prior functions.
     let (mut left_expr, mut left_scope) = plan_table_function_internal(&qcx, &functions[0], true)?;
+    num_cols.push(left_scope.len() - 1);
+
     for function in &functions[1..] {
         // The right hand side of a join must be planned in a new scope.
         let qcx = qcx.empty_derived_context();
         let (right_expr, right_scope) = plan_table_function_internal(&qcx, function, true)?;
+        num_cols.push(right_scope.len() - 1);
         let left_col = left_scope.len() - 1;
         let right_col = left_scope.len() + right_scope.len() - 1;
         let on = HirScalarExpr::CallBinary {
@@ -2210,7 +2248,7 @@ fn plan_rows_from(
     }
     left_scope = plan_table_alias(left_scope, alias)?;
 
-    Ok((left_expr, left_scope))
+    Ok((left_expr, left_scope, num_cols))
 }
 
 /// Plans a table function that appears alone, i.e., that is not part of a `ROWS
@@ -3934,43 +3972,56 @@ pub fn scalar_type_from_pg(ty: &pgrepr::Type) -> Result<ScalarType, PlanError> {
     }
 }
 
-/// This is used to collect aggregates from within an `Expr`.
+/// This is used to collect aggregates and table functions from within an `Expr`.
 /// See the explanation of aggregate handling at the top of the file for more details.
-struct AggregateFuncVisitor<'a, 'ast> {
+struct AggregateTableFuncVisitor<'a, 'ast> {
     scx: &'a StatementContext<'a>,
     aggs: Vec<&'ast Function<Aug>>,
     within_aggregate: bool,
+    tables: Vec<&'ast Function<Aug>>,
+    table_disallowed_context: Vec<&'static str>,
     err: Option<PlanError>,
 }
 
-impl<'a, 'ast> AggregateFuncVisitor<'a, 'ast> {
-    fn new(scx: &'a StatementContext<'a>) -> AggregateFuncVisitor<'a, 'ast> {
-        AggregateFuncVisitor {
+impl<'a, 'ast> AggregateTableFuncVisitor<'a, 'ast> {
+    fn new(scx: &'a StatementContext<'a>) -> AggregateTableFuncVisitor<'a, 'ast> {
+        AggregateTableFuncVisitor {
             scx,
             aggs: Vec::new(),
             within_aggregate: false,
+            tables: Vec::new(),
+            table_disallowed_context: Vec::new(),
             err: None,
         }
     }
 
-    fn into_result(self) -> Result<Vec<&'ast Function<Aug>>, PlanError> {
+    fn into_result(
+        self,
+    ) -> Result<(Vec<&'ast Function<Aug>>, Vec<&'ast Function<Aug>>), PlanError> {
         match self.err {
             Some(err) => Err(err),
             None => {
-                // dedup aggs while preserving the order
-                // (we don't care what the order is, but it has to be reproducible so that EXPLAIN PLAN tests work)
+                // Dedup while preserving the order. We don't care what the order is, but it
+                // has to be reproducible so that EXPLAIN PLAN tests work.
                 let mut seen = HashSet::new();
-                Ok(self
+                let aggs = self
                     .aggs
                     .into_iter()
                     .filter(move |agg| seen.insert(&**agg))
-                    .collect())
+                    .collect();
+                let mut seen = HashSet::new();
+                let tables = self
+                    .tables
+                    .into_iter()
+                    .filter(move |table| seen.insert(&**table))
+                    .collect();
+                Ok((aggs, tables))
             }
         }
     }
 }
 
-impl<'a, 'ast> Visit<'ast, Aug> for AggregateFuncVisitor<'a, 'ast> {
+impl<'a, 'ast> Visit<'ast, Aug> for AggregateTableFuncVisitor<'a, 'ast> {
     fn visit_function(&mut self, func: &'ast Function<Aug>) {
         let item = match self.scx.resolve_function(func.name.clone()) {
             Ok(i) => i,
@@ -3978,36 +4029,81 @@ impl<'a, 'ast> Visit<'ast, Aug> for AggregateFuncVisitor<'a, 'ast> {
             Err(_) => return,
         };
 
-        if let Ok(Func::Aggregate { .. }) = item.func() {
-            if self.within_aggregate {
-                self.err = Some(PlanError::Unstructured(
-                    "nested aggregate functions are not allowed".into(),
-                ));
-                return;
-            }
-            self.aggs.push(func);
-            let Function {
-                name: _,
-                args,
-                filter,
-                over: _,
-                distinct: _,
-            } = func;
-            if let Some(filter) = filter {
-                self.visit_expr(filter);
-            }
-            let old_within_aggregate = self.within_aggregate;
-            self.within_aggregate = true;
-            self.visit_function_args(args);
+        match item.func() {
+            Ok(Func::Aggregate { .. }) => {
+                if self.within_aggregate {
+                    self.err = Some(PlanError::Unstructured(
+                        "nested aggregate functions are not allowed".into(),
+                    ));
+                    return;
+                }
+                self.aggs.push(func);
+                let Function {
+                    name: _,
+                    args,
+                    filter,
+                    over: _,
+                    distinct: _,
+                } = func;
+                if let Some(filter) = filter {
+                    self.visit_expr(filter);
+                }
+                let old_within_aggregate = self.within_aggregate;
+                self.within_aggregate = true;
+                self.table_disallowed_context.push("aggregate functions");
 
-            self.within_aggregate = old_within_aggregate;
-        } else {
-            visit::visit_function(self, func);
+                self.visit_function_args(args);
+
+                self.within_aggregate = old_within_aggregate;
+                self.table_disallowed_context.pop();
+            }
+            Ok(Func::Table { .. }) => {
+                if let Some(context) = self.table_disallowed_context.last() {
+                    self.err = Some(PlanError::Unstructured(format!(
+                        "table functions are not allowed in {}",
+                        context
+                    )));
+                    return;
+                }
+                self.tables.push(func);
+                let Function {
+                    name: _,
+                    args,
+                    filter,
+                    over: _,
+                    distinct: _,
+                } = func;
+                if let Some(filter) = filter {
+                    self.visit_expr(filter);
+                }
+                self.table_disallowed_context.push("other table functions");
+                self.visit_function_args(args);
+                self.table_disallowed_context.pop();
+            }
+            _ => visit::visit_function(self, func),
         }
     }
 
     fn visit_query(&mut self, _query: &'ast Query<Aug>) {
         // Don't go into subqueries.
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr<Aug>) {
+        let disallowed_context = match expr {
+            Expr::Case { .. } => Some("CASE"),
+            Expr::Coalesce { .. } => Some("COALESCE"),
+            _ => None,
+        };
+
+        if let Some(context) = disallowed_context {
+            self.table_disallowed_context.push(context);
+        }
+
+        visit::visit_expr(self, expr);
+
+        if disallowed_context.is_some() {
+            self.table_disallowed_context.pop();
+        }
     }
 }
 

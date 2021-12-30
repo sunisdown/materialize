@@ -16,6 +16,18 @@
 
 mode cockroach
 
+query IT
+select generate_series(1, 2), information_schema._pg_expandarray(ARRAY[100])
+----
+1 (100,1)
+2 NULL
+
+query III
+select generate_series(1, 2), (information_schema._pg_expandarray(ARRAY[100])).*
+----
+1 100 1
+2 NULL NULL
+
 statement ok
 CREATE TABLE y (a JSONB)
 
