@@ -120,8 +120,8 @@ use dataflow_types::{
     DataflowDesc, DataflowDescription, IndexDesc, PeekResponse, Update,
 };
 use expr::{
-    ExprHumanizer, GlobalId, Id, MirRelationExpr, MirScalarExpr, NullaryFunc,
-    OptimizedMirRelationExpr, RowSetFinishing,
+    permutation_for_arrangement, ExprHumanizer, GlobalId, Id, MirRelationExpr, MirScalarExpr,
+    NullaryFunc, OptimizedMirRelationExpr, RowSetFinishing,
 };
 use ore::metrics::MetricsRegistry;
 use ore::now::{to_datetime, NowFn};
@@ -3088,6 +3088,7 @@ where
             .iter()
             .map(|k| MirScalarExpr::Column(*k))
             .collect();
+        let (permutation, thinning) = permutation_for_arrangement(&key, typ.arity());
         // Two transient allocations. We could reclaim these if we don't use them, potentially.
         // TODO: reclaim transient identifiers in fast path cases.
         let view_id = self.allocate_transient_id()?;
@@ -3110,7 +3111,14 @@ where
 
         // At this point, `dataflow_plan` contains our best optimized dataflow.
         // We will check the plan to see if there is a fast path to escape full dataflow construction.
-        let fast_path = fast_path_peek::create_plan(dataflow_plan, view_id, index_id, key)?;
+        let fast_path = fast_path_peek::create_plan(
+            dataflow_plan,
+            view_id,
+            index_id,
+            key,
+            permutation,
+            thinning.len(),
+        )?;
 
         // Implement the peek, and capture the response.
         let resp = self
@@ -4759,11 +4767,22 @@ fn check_statement_safety(stmt: &Statement<Raw>) -> Result<(), CoordError> {
 /// or by reading out of existing arrangements, and implements the appropriate plan.
 pub mod fast_path_peek {
 
+    use std::collections::HashMap;
+
     use dataflow_types::client::{ComputeClient, StorageClient};
 
     use crate::CoordError;
-    use expr::{permutation_for_arrangement, EvalError, GlobalId, Id, MirScalarExpr};
+    use expr::{EvalError, GlobalId, Id, MirScalarExpr};
     use repr::{Diff, Row};
+
+    #[derive(Debug)]
+    pub struct PeekDataflowPlan {
+        desc: dataflow_types::DataflowDescription<dataflow_types::Plan>,
+        id: GlobalId,
+        key: Vec<MirScalarExpr>,
+        permutation: HashMap<usize, usize>,
+        thinned_arity: usize,
+    }
 
     /// Possible ways in which the coordinator could produce the result for a goal view.
     #[derive(Debug)]
@@ -4773,11 +4792,7 @@ pub mod fast_path_peek {
         /// The view can be read out of an existing arrangement.
         PeekExisting(GlobalId, Option<Row>, expr::SafeMfpPlan),
         /// The view must be installed as a dataflow and then read.
-        PeekDataflow(
-            dataflow_types::DataflowDescription<dataflow_types::Plan>,
-            GlobalId,
-            Vec<MirScalarExpr>,
-        ),
+        PeekDataflow(PeekDataflowPlan),
     }
 
     /// Determine if the dataflow plan can be implemented without an actual dataflow.
@@ -4790,6 +4805,8 @@ pub mod fast_path_peek {
         view_id: GlobalId,
         index_id: GlobalId,
         index_key: Vec<MirScalarExpr>,
+        index_permutation: HashMap<usize, usize>,
+        index_thinned_arity: usize,
     ) -> Result<Plan, CoordError> {
         // At this point, `dataflow_plan` contains our best optimized dataflow.
         // We will check the plan to see if there is a fast path to escape full dataflow construction.
@@ -4845,7 +4862,13 @@ pub mod fast_path_peek {
                 _ => {}
             }
         }
-        return Ok(Plan::PeekDataflow(dataflow_plan, index_id, index_key));
+        return Ok(Plan::PeekDataflow(PeekDataflowPlan {
+            desc: dataflow_plan,
+            id: index_id,
+            key: index_key,
+            permutation: index_permutation,
+            thinned_arity: index_thinned_arity,
+        }));
     }
 
     impl<C> crate::coord::Coordinator<C>
@@ -4916,19 +4939,19 @@ pub mod fast_path_peek {
                     ),
                     None,
                 ),
-                Plan::PeekDataflow(dataflow, index_id, index_key) => {
+                Plan::PeekDataflow(PeekDataflowPlan {
+                    desc: dataflow,
+                    id: index_id,
+                    key: index_key,
+                    permutation: index_permutation,
+                    thinned_arity: index_thinned_arity,
+                }) => {
                     // Very important: actually create the dataflow (here, so we can destructure).
                     self.dataflow_client.create_dataflows(vec![dataflow]).await;
-
-                    // TODO[btv]
-                    //
-                    // We should get these values from the same place
-                    // the key was created, rather than creating them here.
-                    let (permutation, thinning) =
-                        permutation_for_arrangement(&index_key, source_arity);
                     // Create an identity MFP operator.
                     let mut map_filter_project = expr::MapFilterProject::new(source_arity);
-                    map_filter_project.permute(permutation, index_key.len() + thinning.len());
+                    map_filter_project
+                        .permute(index_permutation, index_key.len() + index_thinned_arity);
                     let map_filter_project = map_filter_project
                         .into_plan()
                         .map_err(|e| crate::error::CoordError::Unstructured(::anyhow::anyhow!(e)))?
